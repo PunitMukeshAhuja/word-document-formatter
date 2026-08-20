@@ -1,6 +1,8 @@
 
 import io
 import re
+import hashlib
+import html
 import pandas as pd
 import streamlit as st
 from docx import Document
@@ -17,24 +19,28 @@ st.set_page_config(
 
 st.title("📝 Word Document Formatter")
 st.caption(
-    "Upload a Word document, preview detected structure, correct it manually, "
-    "apply formatting, and download the cleaned file."
+    "Upload a Word document, review its detected structure and proposed formatting, "
+    "preview the document visually, then download the formatted Word file."
 )
 
-CLASSIFICATION_OPTIONS = ["Title", "Heading 1", "Heading 2", "Heading 3", "Body"]
+CLASS_OPTIONS = ["Title", "Heading 1", "Heading 2", "Heading 3", "Body"]
 
-# -----------------------------
+# -------------------------------------------------------
 # Helpers
-# -----------------------------
+# -------------------------------------------------------
+
+def file_signature(file_bytes):
+    return hashlib.md5(file_bytes).hexdigest()
 
 def paragraph_text(paragraph):
     return paragraph.text.strip()
 
 def average_font_size(paragraph):
-    sizes = []
-    for run in paragraph.runs:
-        if run.font.size:
-            sizes.append(run.font.size.pt)
+    sizes = [
+        run.font.size.pt
+        for run in paragraph.runs
+        if run.font.size
+    ]
     return sum(sizes) / len(sizes) if sizes else None
 
 def mostly_bold(paragraph):
@@ -47,6 +53,222 @@ def mostly_bold(paragraph):
 def is_all_caps(text):
     letters = [c for c in text if c.isalpha()]
     return bool(letters) and all(c.isupper() for c in letters)
+
+def detect_heading_level(paragraph, auto_detect, body_size):
+    text = paragraph_text(paragraph)
+
+    if not text:
+        return None
+
+    style_name = paragraph.style.name if paragraph.style else ""
+
+    # Existing Word styles always take priority.
+    if style_name == "Title":
+        return 0
+    if style_name == "Heading 1":
+        return 1
+    if style_name == "Heading 2":
+        return 2
+    if style_name == "Heading 3":
+        return 3
+
+    # With auto-detection OFF, do not infer structure.
+    if not auto_detect:
+        return None
+
+    if len(text) > 120:
+        return None
+
+    # 1. Introduction / 1.1 Scope / 1.1.1 Detail
+    numbered = re.match(r"^\s*(\d+(?:\.\d+){0,2})[\.\)]?\s+\S+", text)
+    if numbered:
+        depth = numbered.group(1).count(".") + 1
+        return min(depth, 3)
+
+    avg_size = average_font_size(paragraph)
+    bold = mostly_bold(paragraph)
+    caps = is_all_caps(text)
+
+    if (
+        len(text) <= 70
+        and caps
+        and bold
+        and avg_size is not None
+        and avg_size >= body_size + 4
+    ):
+        return 0
+
+    if (
+        len(text) <= 60
+        and caps
+        and (bold or (avg_size is not None and avg_size >= body_size + 2))
+    ):
+        return 1
+
+    if len(text) <= 70 and bold:
+        if avg_size is not None and avg_size >= body_size + 3:
+            return 1
+        if avg_size is not None and avg_size >= body_size + 1:
+            return 2
+        return 2
+
+    if len(text) <= 80 and avg_size is not None:
+        if avg_size >= body_size + 4:
+            return 1
+        if avg_size >= body_size + 2:
+            return 2
+        if avg_size >= body_size + 1:
+            return 3
+
+    return None
+
+def classification_label(level):
+    return {
+        0: "Title",
+        1: "Heading 1",
+        2: "Heading 2",
+        3: "Heading 3",
+        None: "Body"
+    }[level]
+
+def format_properties(
+    final_type,
+    body_size,
+    title_size,
+    heading1_size,
+    heading2_size,
+    heading3_size,
+    body_alignment,
+    line_spacing,
+    space_after
+):
+    if final_type == "Title":
+        return {
+            "size": title_size,
+            "bold": True,
+            "alignment": "Center",
+            "space_before": 0,
+            "space_after": 12,
+            "line_spacing": line_spacing
+        }
+
+    if final_type == "Heading 1":
+        return {
+            "size": heading1_size,
+            "bold": True,
+            "alignment": "Left",
+            "space_before": 10,
+            "space_after": 6,
+            "line_spacing": line_spacing
+        }
+
+    if final_type == "Heading 2":
+        return {
+            "size": heading2_size,
+            "bold": True,
+            "alignment": "Left",
+            "space_before": 8,
+            "space_after": 4,
+            "line_spacing": line_spacing
+        }
+
+    if final_type == "Heading 3":
+        return {
+            "size": heading3_size,
+            "bold": True,
+            "alignment": "Left",
+            "space_before": 6,
+            "space_after": 3,
+            "line_spacing": line_spacing
+        }
+
+    return {
+        "size": body_size,
+        "bold": False,
+        "alignment": body_alignment,
+        "space_before": 0,
+        "space_after": space_after,
+        "line_spacing": line_spacing
+    }
+
+def build_base_preview(file_bytes, auto_detect, body_size):
+    doc = Document(io.BytesIO(file_bytes))
+    rows = []
+
+    for idx, paragraph in enumerate(doc.paragraphs):
+        text = paragraph_text(paragraph)
+        if not text:
+            continue
+
+        detected = classification_label(
+            detect_heading_level(paragraph, auto_detect, body_size)
+        )
+
+        avg_size = average_font_size(paragraph)
+
+        rows.append({
+            "Paragraph index": idx,
+            "Detected as": detected,
+            "Final type": detected,
+            "Text preview": text[:180] + ("..." if len(text) > 180 else ""),
+            "Original style": paragraph.style.name if paragraph.style else "",
+            "Original size": round(avg_size, 1) if avg_size else None,
+            "Originally bold": "Yes" if mostly_bold(paragraph) else "No"
+        })
+
+    return pd.DataFrame(rows)
+
+def apply_saved_overrides(df, overrides):
+    if df.empty:
+        return df
+
+    result = df.copy()
+    result["Final type"] = result.apply(
+        lambda row: overrides.get(
+            int(row["Paragraph index"]),
+            row["Detected as"]
+        ),
+        axis=1
+    )
+    return result
+
+def add_output_columns(
+    df,
+    body_size,
+    title_size,
+    heading1_size,
+    heading2_size,
+    heading3_size,
+    body_alignment,
+    line_spacing,
+    space_after
+):
+    if df.empty:
+        return df
+
+    result = df.copy()
+
+    props = result["Final type"].apply(
+        lambda final_type: format_properties(
+            final_type,
+            body_size,
+            title_size,
+            heading1_size,
+            heading2_size,
+            heading3_size,
+            body_alignment,
+            line_spacing,
+            space_after
+        )
+    )
+
+    result["Output size"] = props.apply(lambda p: p["size"])
+    result["Output bold"] = props.apply(lambda p: "Yes" if p["bold"] else "No")
+    result["Output alignment"] = props.apply(lambda p: p["alignment"])
+    result["Line spacing"] = props.apply(lambda p: p["line_spacing"])
+    result["Space after"] = props.apply(lambda p: p["space_after"])
+
+    return result
 
 def set_run_font(run, name, size, bold=None):
     run.font.name = name
@@ -84,100 +306,101 @@ def add_page_number(paragraph):
     run._r.append(instr_text)
     run._r.append(fld_char2)
 
-def detect_heading_level(paragraph, auto_detect, body_size):
-    text = paragraph_text(paragraph)
+def build_final_type_map(final_df):
+    return {
+        int(row["Paragraph index"]): row["Final type"]
+        for _, row in final_df.iterrows()
+    }
 
-    if not text:
-        return None
-
-    style_name = paragraph.style.name if paragraph.style else ""
-
-    if style_name == "Title":
-        return 0
-    if style_name == "Heading 1":
-        return 1
-    if style_name == "Heading 2":
-        return 2
-    if style_name == "Heading 3":
-        return 3
-
-    if not auto_detect:
-        return None
-
-    if len(text) > 120:
-        return None
-
-    numbered = re.match(r"^\s*(\d+(?:\.\d+){0,2})[\.\)]?\s+\S+", text)
-    if numbered:
-        number_part = numbered.group(1)
-        depth = number_part.count(".") + 1
-        return min(depth, 3)
-
-    avg_size = average_font_size(paragraph)
-    bold = mostly_bold(paragraph)
-    caps = is_all_caps(text)
-
-    if len(text) <= 70 and caps and bold and avg_size and avg_size >= body_size + 4:
-        return 0
-
-    if len(text) <= 60 and caps and (bold or (avg_size and avg_size >= body_size + 2)):
-        return 1
-
-    if len(text) <= 70 and bold:
-        if avg_size and avg_size >= body_size + 3:
-            return 1
-        if avg_size and avg_size >= body_size + 1:
-            return 2
-        return 2
-
-    if len(text) <= 80 and avg_size:
-        if avg_size >= body_size + 4:
-            return 1
-        if avg_size >= body_size + 2:
-            return 2
-        if avg_size >= body_size + 1:
-            return 3
-
-    return None
-
-def classification_label(level):
-    if level == 0:
-        return "Title"
-    if level == 1:
-        return "Heading 1"
-    if level == 2:
-        return "Heading 2"
-    if level == 3:
-        return "Heading 3"
-    return "Body"
-
-def build_preview(file_bytes, auto_detect, body_size):
+def render_print_preview(
+    file_bytes,
+    final_type_map,
+    font_name,
+    body_size,
+    title_size,
+    heading1_size,
+    heading2_size,
+    heading3_size,
+    body_alignment,
+    line_spacing,
+    space_after,
+    margin
+):
     doc = Document(io.BytesIO(file_bytes))
-    rows = []
 
-    for idx, paragraph in enumerate(doc.paragraphs, start=1):
+    paragraphs_html = []
+
+    for idx, paragraph in enumerate(doc.paragraphs):
         text = paragraph_text(paragraph)
         if not text:
             continue
 
-        level = detect_heading_level(
-            paragraph=paragraph,
-            auto_detect=auto_detect,
-            body_size=body_size
+        final_type = final_type_map.get(idx, "Body")
+
+        props = format_properties(
+            final_type,
+            body_size,
+            title_size,
+            heading1_size,
+            heading2_size,
+            heading3_size,
+            body_alignment,
+            line_spacing,
+            space_after
         )
 
-        rows.append({
-            "Paragraph": idx,
-            "Detected as": classification_label(level),
-            "Apply as": classification_label(level),
-            "Text preview": text[:160] + ("..." if len(text) > 160 else ""),
-            "Original style": paragraph.style.name if paragraph.style else "",
-            "Avg font size": round(average_font_size(paragraph), 1)
-            if average_font_size(paragraph) else None,
-            "Mostly bold": "Yes" if mostly_bold(paragraph) else "No",
-        })
+        align_css = {
+            "Left": "left",
+            "Center": "center",
+            "Right": "right",
+            "Justified": "justify"
+        }[props["alignment"]]
 
-    return pd.DataFrame(rows)
+        weight = "700" if props["bold"] else "400"
+
+        escaped = html.escape(text)
+
+        paragraphs_html.append(
+            f"""
+            <div style="
+                font-family:{html.escape(font_name)};
+                font-size:{props['size']}pt;
+                font-weight:{weight};
+                text-align:{align_css};
+                line-height:{props['line_spacing']};
+                margin-top:{props['space_before']}pt;
+                margin-bottom:{props['space_after']}pt;
+                overflow-wrap:anywhere;
+            ">{escaped}</div>
+            """
+        )
+
+    margin_px = int(float(margin) * 96)
+
+    content = "\n".join(paragraphs_html)
+
+    return f"""
+    <div style="
+        background:#e9edf2;
+        padding:24px;
+        border-radius:10px;
+        overflow:auto;
+        max-height:900px;
+    ">
+        <div style="
+            width:min(794px, 100%);
+            min-height:1123px;
+            box-sizing:border-box;
+            margin:0 auto 24px auto;
+            background:white;
+            padding:{margin_px}px;
+            box-shadow:0 2px 14px rgba(0,0,0,0.18);
+            color:#111;
+        ">
+            {content}
+        </div>
+    </div>
+    """
 
 def format_table(table, font_name, body_size):
     for row in table.rows:
@@ -191,17 +414,18 @@ def format_table(table, font_name, body_size):
 
 def format_document(
     file_bytes,
+    final_type_map,
     font_name,
     body_size,
     line_spacing,
-    alignment,
+    alignment_enum,
+    body_alignment_label,
     space_after,
     margin,
     title_size,
     heading1_size,
     heading2_size,
     heading3_size,
-    manual_map,
     add_page_numbers
 ):
     doc = Document(io.BytesIO(file_bytes))
@@ -212,51 +436,47 @@ def format_document(
         section.left_margin = Inches(margin)
         section.right_margin = Inches(margin)
 
-    for idx, paragraph in enumerate(doc.paragraphs, start=1):
-        if not paragraph_text(paragraph):
+    for idx, paragraph in enumerate(doc.paragraphs):
+        text = paragraph_text(paragraph)
+        if not text:
             continue
 
-        classification = manual_map.get(idx, "Body")
+        final_type = final_type_map.get(idx, "Body")
 
-        if classification == "Title":
-            size = title_size
-            bold = True
+        props = format_properties(
+            final_type,
+            body_size,
+            title_size,
+            heading1_size,
+            heading2_size,
+            heading3_size,
+            body_alignment_label,
+            line_spacing,
+            space_after
+        )
+
+        if props["alignment"] == "Center":
             paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
-            paragraph.paragraph_format.space_before = Pt(0)
-            paragraph.paragraph_format.space_after = Pt(12)
-
-        elif classification == "Heading 1":
-            size = heading1_size
-            bold = True
+        elif props["alignment"] == "Left":
             paragraph.alignment = WD_ALIGN_PARAGRAPH.LEFT
-            paragraph.paragraph_format.space_before = Pt(10)
-            paragraph.paragraph_format.space_after = Pt(6)
-
-        elif classification == "Heading 2":
-            size = heading2_size
-            bold = True
-            paragraph.alignment = WD_ALIGN_PARAGRAPH.LEFT
-            paragraph.paragraph_format.space_before = Pt(8)
-            paragraph.paragraph_format.space_after = Pt(4)
-
-        elif classification == "Heading 3":
-            size = heading3_size
-            bold = True
-            paragraph.alignment = WD_ALIGN_PARAGRAPH.LEFT
-            paragraph.paragraph_format.space_before = Pt(6)
-            paragraph.paragraph_format.space_after = Pt(3)
-
+        elif props["alignment"] == "Right":
+            paragraph.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+        elif props["alignment"] == "Justified":
+            paragraph.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
         else:
-            size = body_size
-            bold = None
-            paragraph.alignment = alignment
-            paragraph.paragraph_format.space_before = Pt(0)
-            paragraph.paragraph_format.space_after = Pt(space_after)
+            paragraph.alignment = alignment_enum
 
-        paragraph.paragraph_format.line_spacing = line_spacing
+        paragraph.paragraph_format.space_before = Pt(props["space_before"])
+        paragraph.paragraph_format.space_after = Pt(props["space_after"])
+        paragraph.paragraph_format.line_spacing = props["line_spacing"]
 
         for run in paragraph.runs:
-            set_run_font(run, font_name, size, bold)
+            set_run_font(
+                run,
+                font_name,
+                props["size"],
+                props["bold"] if final_type != "Body" else None
+            )
 
     for table in doc.tables:
         format_table(table, font_name, body_size)
@@ -264,7 +484,11 @@ def format_document(
     if add_page_numbers:
         for section in doc.sections:
             footer = section.footer
-            paragraph = footer.paragraphs[0] if footer.paragraphs else footer.add_paragraph()
+            paragraph = (
+                footer.paragraphs[0]
+                if footer.paragraphs
+                else footer.add_paragraph()
+            )
             paragraph.clear()
             add_page_number(paragraph)
 
@@ -273,34 +497,45 @@ def format_document(
     output.seek(0)
     return output
 
-# -----------------------------
+# -------------------------------------------------------
+# Session state
+# -------------------------------------------------------
+
+if "manual_overrides" not in st.session_state:
+    st.session_state.manual_overrides = {}
+
+if "last_file_sig" not in st.session_state:
+    st.session_state.last_file_sig = None
+
+# -------------------------------------------------------
 # UI
-# -----------------------------
+# -------------------------------------------------------
 
 uploaded_file = st.file_uploader(
     "Upload a Word document",
     type=["docx"],
-    help="Only .docx files are supported in this version."
+    help="Only .docx files are supported."
 )
 
 if uploaded_file:
     file_bytes = uploaded_file.getvalue()
+    current_sig = file_signature(file_bytes)
 
-    if st.session_state.get("current_file_name") != uploaded_file.name:
-        st.session_state["current_file_name"] = uploaded_file.name
-        st.session_state.pop("edited_preview", None)
+    if st.session_state.last_file_sig != current_sig:
+        st.session_state.manual_overrides = {}
+        st.session_state.last_file_sig = current_sig
         st.session_state.pop("formatted_doc", None)
         st.session_state.pop("output_name", None)
 
     st.success(f"Loaded: {uploaded_file.name}")
 
-    left, right = st.columns([1, 1])
+    left, right = st.columns(2)
 
     with left:
-        st.subheader("1. Formatting")
+        st.subheader("1. Body formatting")
 
         font_name = st.selectbox(
-            "Body font",
+            "Font",
             ["Times New Roman", "Arial", "Calibri", "Aptos", "Georgia"],
             index=0
         )
@@ -347,14 +582,14 @@ if uploaded_file:
         )
 
     with right:
-        st.subheader("2. Heading detection")
+        st.subheader("2. Structure & heading sizes")
 
-        auto_detect_headings = st.checkbox(
+        auto_detect = st.checkbox(
             "Auto-detect headings",
             value=True,
             help=(
-                "Tries to detect headings using Word styles, numbering, "
-                "bold text, capitalization, font size and paragraph length."
+                "ON: infer headings from numbering, capitalization, bold text and "
+                "original font size. OFF: use only existing Word heading styles."
             )
         )
 
@@ -366,133 +601,229 @@ if uploaded_file:
         add_page_numbers = st.checkbox("Add page numbers", value=True)
 
     st.divider()
+    st.subheader("3. Review structure & proposed formatting")
 
-    st.subheader("3. Review & correct structure")
-
-    auto_preview_df = build_preview(
-        file_bytes=file_bytes,
-        auto_detect=auto_detect_headings,
-        body_size=body_size
-    )
-
-    # Reset edited preview if structure/settings change materially.
-    preview_signature = (
-        uploaded_file.name,
-        uploaded_file.size,
-        auto_detect_headings,
+    base_df = build_base_preview(
+        file_bytes,
+        auto_detect,
         body_size
     )
 
-    if st.session_state.get("preview_signature") != preview_signature:
-        st.session_state["edited_preview"] = auto_preview_df.copy()
-        st.session_state["preview_signature"] = preview_signature
-
-    st.write(
-        "You can change **Apply as** for any paragraph before formatting. "
-        "The original automatic detection remains visible for comparison."
+    base_df = apply_saved_overrides(
+        base_df,
+        st.session_state.manual_overrides
     )
 
-    edited_df = st.data_editor(
-        st.session_state["edited_preview"],
-        use_container_width=True,
-        hide_index=True,
-        disabled=[
-            "Paragraph",
-            "Detected as",
-            "Text preview",
-            "Original style",
-            "Avg font size",
-            "Mostly bold"
-        ],
-        column_config={
-            "Apply as": st.column_config.SelectboxColumn(
-                "Apply as",
-                help="Manually choose how this paragraph should be formatted.",
-                options=CLASSIFICATION_OPTIONS,
-                required=True
-            ),
-            "Text preview": st.column_config.TextColumn(
-                "Text preview",
-                width="large"
-            )
-        },
-        key="structure_editor"
+    display_df = add_output_columns(
+        base_df,
+        body_size,
+        title_size,
+        heading1_size,
+        heading2_size,
+        heading3_size,
+        alignment_label,
+        line_spacing,
+        space_after
     )
 
-    st.session_state["edited_preview"] = edited_df.copy()
+    if display_df.empty:
+        st.info("No text paragraphs were found.")
+        edited_df = display_df
 
-    if not edited_df.empty:
-        c1, c2, c3, c4, c5 = st.columns(5)
-        c1.metric("Title", int((edited_df["Apply as"] == "Title").sum()))
-        c2.metric("Heading 1", int((edited_df["Apply as"] == "Heading 1").sum()))
-        c3.metric("Heading 2", int((edited_df["Apply as"] == "Heading 2").sum()))
-        c4.metric("Heading 3", int((edited_df["Apply as"] == "Heading 3").sum()))
-        c5.metric("Body", int((edited_df["Apply as"] == "Body").sum()))
-
-    b1, b2 = st.columns([1, 1])
-
-    with b1:
-        if st.button("↩️ Reset to auto-detection", use_container_width=True):
-            st.session_state["edited_preview"] = auto_preview_df.copy()
-            st.rerun()
-
-    with b2:
+    else:
         st.caption(
-            "Tip: correct only the paragraphs that look wrong; the rest can stay as detected."
+            "Change **Final type** when detection is wrong. The output-size, alignment "
+            "and spacing columns show exactly what will be applied."
+        )
+
+        edited_df = st.data_editor(
+            display_df,
+            use_container_width=True,
+            hide_index=True,
+            num_rows="fixed",
+            disabled=[
+                "Paragraph index",
+                "Detected as",
+                "Text preview",
+                "Original style",
+                "Original size",
+                "Originally bold",
+                "Output size",
+                "Output bold",
+                "Output alignment",
+                "Line spacing",
+                "Space after"
+            ],
+            column_config={
+                "Final type": st.column_config.SelectboxColumn(
+                    "Final type",
+                    options=CLASS_OPTIONS,
+                    required=True
+                ),
+                "Text preview": st.column_config.TextColumn(
+                    "Text preview",
+                    width="large"
+                ),
+                "Output size": st.column_config.NumberColumn(
+                    "Output size (pt)"
+                ),
+                "Space after": st.column_config.NumberColumn(
+                    "Space after (pt)"
+                )
+            },
+            key=f"editor_{current_sig}"
+        )
+
+        new_overrides = {}
+
+        for _, row in edited_df.iterrows():
+            idx = int(row["Paragraph index"])
+
+            if row["Final type"] != row["Detected as"]:
+                new_overrides[idx] = row["Final type"]
+
+        st.session_state.manual_overrides = new_overrides
+
+        # Recalculate output columns AFTER any manual edits.
+        edited_df = add_output_columns(
+            edited_df.drop(
+                columns=[
+                    "Output size",
+                    "Output bold",
+                    "Output alignment",
+                    "Line spacing",
+                    "Space after"
+                ],
+                errors="ignore"
+            ),
+            body_size,
+            title_size,
+            heading1_size,
+            heading2_size,
+            heading3_size,
+            alignment_label,
+            line_spacing,
+            space_after
+        )
+
+        counts = edited_df["Final type"].value_counts()
+        c1, c2, c3, c4, c5 = st.columns(5)
+        c1.metric("Title", int(counts.get("Title", 0)))
+        c2.metric("Heading 1", int(counts.get("Heading 1", 0)))
+        c3.metric("Heading 2", int(counts.get("Heading 2", 0)))
+        c4.metric("Heading 3", int(counts.get("Heading 3", 0)))
+        c5.metric("Body", int(counts.get("Body", 0)))
+
+        col_a, col_b = st.columns([1, 3])
+
+        with col_a:
+            if st.button("Reset manual corrections"):
+                st.session_state.manual_overrides = {}
+                st.rerun()
+
+        with col_b:
+            st.caption(
+                f"Auto detection: {'ON' if auto_detect else 'OFF'} • "
+                f"Manual corrections: {len(st.session_state.manual_overrides)}"
+            )
+
+    st.divider()
+    st.subheader("4. Print-style preview")
+
+    preview_enabled = st.checkbox(
+        "Show formatted document preview",
+        value=True,
+        help="Shows an approximate print-style view before the Word file is created."
+    )
+
+    if preview_enabled and not edited_df.empty:
+        final_type_map = build_final_type_map(edited_df)
+
+        preview_html = render_print_preview(
+            file_bytes=file_bytes,
+            final_type_map=final_type_map,
+            font_name=font_name,
+            body_size=body_size,
+            title_size=title_size,
+            heading1_size=heading1_size,
+            heading2_size=heading2_size,
+            heading3_size=heading3_size,
+            body_alignment=alignment_label,
+            line_spacing=line_spacing,
+            space_after=space_after,
+            margin=margin
+        )
+
+        st.components.v1.html(
+            preview_html,
+            height=850,
+            scrolling=True
+        )
+
+        st.caption(
+            "This preview is for structural and visual review. Exact line wrapping, "
+            "table layout and page breaks can differ slightly in Microsoft Word."
         )
 
     st.divider()
-    st.subheader("4. Format & download")
+    st.subheader("5. Generate & download")
 
-    if st.button("✨ Format document", type="primary", use_container_width=True):
+    if not edited_df.empty:
+        final_type_map = build_final_type_map(edited_df)
+    else:
+        final_type_map = {}
+
+    if st.button(
+        "✨ Generate formatted Word document",
+        type="primary",
+        use_container_width=True
+    ):
         try:
-            manual_map = {
-                int(row["Paragraph"]): row["Apply as"]
-                for _, row in st.session_state["edited_preview"].iterrows()
-            }
-
             result = format_document(
                 file_bytes=file_bytes,
+                final_type_map=final_type_map,
                 font_name=font_name,
                 body_size=body_size,
                 line_spacing=line_spacing,
-                alignment=alignment_map[alignment_label],
+                alignment_enum=alignment_map[alignment_label],
+                body_alignment_label=alignment_label,
                 space_after=space_after,
                 margin=margin,
                 title_size=title_size,
                 heading1_size=heading1_size,
                 heading2_size=heading2_size,
                 heading3_size=heading3_size,
-                manual_map=manual_map,
                 add_page_numbers=add_page_numbers
             )
 
-            st.session_state["formatted_doc"] = result.getvalue()
-            st.session_state["output_name"] = uploaded_file.name.replace(
-                ".docx", "_formatted.docx"
+            st.session_state.formatted_doc = result.getvalue()
+            st.session_state.output_name = uploaded_file.name.replace(
+                ".docx",
+                "_formatted.docx"
             )
 
-            st.success("Formatting complete.")
+            st.success(
+                "Document generated. Review the preview above, then download when ready."
+            )
 
         except Exception as exc:
             st.error(f"Could not format the document: {exc}")
 
     if "formatted_doc" in st.session_state:
         st.download_button(
-            "⬇️ Download formatted document",
-            data=st.session_state["formatted_doc"],
-            file_name=st.session_state["output_name"],
+            "⬇️ Download formatted Word document",
+            data=st.session_state.formatted_doc,
+            file_name=st.session_state.output_name,
             mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
             use_container_width=True
         )
 
 else:
     st.info(
-        "Upload a .docx file to begin. You can preview and manually correct "
-        "the detected structure before formatting."
+        "Upload a .docx file to review its structure and see a print-style preview."
     )
 
 st.divider()
 st.caption(
-    "Automatic heading detection is heuristic-based. Manual corrections in the preview are applied to the downloaded document."
+    "Manual structure corrections always take priority over automatic heading detection."
 )

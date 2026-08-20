@@ -1,29 +1,33 @@
-# Word Document Formatter v4
+# Word Document Formatter v6
 
-A Streamlit application for cleaning and standardizing Word documents.
+## New in v6
 
-## New in v4
+- Grid now shows proposed output formatting:
+  - output font size
+  - bold
+  - alignment
+  - line spacing
+  - paragraph spacing
+- Heading/body size changes are visible in the review grid.
+- Manual paragraph-type correction remains editable.
+- Added print-style visual document preview before download.
+- Preview reflects current:
+  - font
+  - body size
+  - title size
+  - heading sizes
+  - alignment
+  - spacing
+  - margins
+  - manual structure corrections
+- Generate Word document only after visual review.
 
-- Editable preview using Streamlit Data Editor
-- Manually change any paragraph to:
-  - Title
-  - Heading 1
-  - Heading 2
-  - Heading 3
-  - Body
-- Automatic detection remains visible alongside manual classification
-- Manual overrides are applied to the final downloaded Word document
-- Reset button restores automatic heading detection
-- Updated heading/body counts reflect manual changes
+## Preview limitation
 
-## Run locally
+The browser preview is an approximate structural/visual preview. Microsoft Word may paginate
+slightly differently because browser rendering and Word's layout engine are different.
 
-```bash
-pip install -r requirements.txt
-streamlit run app.py
-```
+## Deploy
 
-## Update an existing Streamlit deployment
-
-Replace the existing `app.py` and `requirements.txt` in GitHub and commit the changes.
-Streamlit Community Cloud should redeploy automatically.
+Replace `app.py` and `requirements.txt` in your existing GitHub repository and commit.
+Streamlit Community Cloud should automatically redeploy.
